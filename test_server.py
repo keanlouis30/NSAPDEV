@@ -1,103 +1,127 @@
-"""
-Multi-Client TCP Server (Python)
----------------------------------
-Uses the `threading` module to handle each client in its own thread.
-Run: python tcp_server.py
-Test: telnet localhost 9999  OR  python tcp_client.py
-"""
-
 import socket
 import threading
-import logging
+import sqlite3
+import re
+import os
 
-# ── Configuration ────────────────────────────────────────────────────────────
-HOST = "0.0.0.0"   # Listen on all interfaces
-PORT = 9999
-BUFFER_SIZE = 1024
-MAX_CONNECTIONS = 10
+# --- Configuration ---
+HOST = '0.0.0.0'
+PORT = 65432
+DB_FILE = 'syslog_data.db'
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(threadName)s] %(levelname)s: %(message)s",
-)
-log = logging.getLogger(__name__)
+# --- Database setup ---
+def initialize_db():
+    """Initializes the database and the table for storing logs."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            hostname TEXT,
+            process TEXT,
+            severity TEXT,
+            message TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-# ── Shared state (thread-safe) ────────────────────────────────────────────────
-clients: dict[socket.socket, str] = {}   # socket → address string
-clients_lock = threading.Lock()
+def parse_syslog(line):
+    """Parses a standard syslog line into its components."""
+    # Example format: Feb 22 01:14:22 SYSSVR1 sshd[4421]: Failed password for invalid user admin
+    pattern = r'^(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+([^:\[\s]+)(?:\[(\d+)\])?:\s*(.*)$'
+    match = re.match(pattern, line)
+    if match:
+        timestamp, hostname, process_name, pid, message = match.groups()
+        severity = 'INFO'
+        if 'error' in message.lower() or 'fail' in message.lower():
+            severity = 'ERROR'
+        elif 'warn' in message.lower():
+            severity = 'WARNING'
+        return (timestamp, hostname, process_name, severity, message)
+    return None
 
-
-def broadcast(message: str, sender: socket.socket | None = None) -> None:
-    """Send a message to every connected client except the sender."""
-    with clients_lock:
-        targets = [(sock, addr) for sock, addr in clients.items() if sock is not sender]
-
-    for sock, addr in targets:
-        try:
-            sock.sendall(message.encode())
-        except OSError:
-            log.warning("Failed to send to %s", addr)
-
-
-def handle_client(conn: socket.socket, addr: tuple) -> None:
-    """Thread target: read from a client and echo/broadcast its messages."""
-    addr_str = f"{addr[0]}:{addr[1]}"
-    log.info("Connected: %s", addr_str)
-
-    with clients_lock:
-        clients[conn] = addr_str
-
-    broadcast(f"[Server] {addr_str} joined the chat.\n", sender=conn)
-
+def handle_client(conn, addr):
+    """Handles communication with a single client."""
     try:
-        while True:
-            data = conn.recv(BUFFER_SIZE)
-            if not data:
-                break  # Client disconnected gracefully
+        data = conn.recv(1024 * 1024).decode('utf-8')
+        if not data:
+            return
 
-            message = data.decode(errors="replace").strip()
-            log.info("Received from %s: %s", addr_str, message)
+        parts = data.split(' ', 1)
+        command = parts[0].upper()
 
-            # Echo back to sender
-            conn.sendall(f"[You]: {message}\n".encode())
+        if command == 'INGEST':
+            log_entries = parts[1].strip().splitlines()
+            db = sqlite3.connect(DB_FILE)
+            cursor = db.cursor()
+            count = 0
+            for line in log_entries:
+                parsed = parse_syslog(line)
+                if parsed:
+                    cursor.execute('''
+                        INSERT INTO logs (timestamp, hostname, process, severity, message)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', parsed)
+                    count += 1
+            db.commit()
+            db.close()
+            conn.sendall(f"SUCCESS: {count} entries indexed.".encode('utf-8'))
 
-            # Broadcast to all others
-            broadcast(f"[{addr_str}]: {message}\n", sender=conn)
+        elif command == 'QUERY':
+            q_parts = parts[1].split(' ', 1)
+            q_type = q_parts[0].upper()
+            q_val = q_parts[1].strip('"')
 
-    except (ConnectionResetError, OSError) as exc:
-        log.warning("Connection error with %s: %s", addr_str, exc)
+            db = sqlite3.connect(DB_FILE)
+            cursor = db.cursor()
+            
+            query_map = {
+                'SEARCH_DATE': "SELECT * FROM logs WHERE timestamp LIKE ?",
+                'SEARCH_HOST': "SELECT * FROM logs WHERE hostname = ?",
+                'SEARCH_DAEMON': "SELECT * FROM logs WHERE process = ?",
+                'SEARCH_SEVERITY': "SELECT * FROM logs WHERE severity = ?",
+                'SEARCH_KEYWORD': "SELECT * FROM logs WHERE message LIKE ?",
+                'COUNT_KEYWORD': "SELECT COUNT(*) FROM logs WHERE message LIKE ?"
+            }
+
+            if q_type in query_map:
+                param = f"%{q_val}%" if 'KEYWORD' in q_type or 'DATE' in q_type else q_val
+                cursor.execute(query_map[q_type], (param,))
+                results = cursor.fetchall()
+                
+                if q_type == 'COUNT_KEYWORD':
+                    conn.sendall(f"The keyword '{q_val}' appears in {results[0][0]} indexed log entry.".encode('utf-8'))
+                else:
+                    response = "\n".join([f"{r[1]} {r[2]} {r[3]}: {r[5]}" for r in results])
+                    conn.sendall(response.encode('utf-8') if response else "No matches found.".encode('utf-8'))
+            db.close()
+
+        elif command == 'PURGE':
+            db = sqlite3.connect(DB_FILE)
+            cursor = db.cursor()
+            cursor.execute("DELETE FROM logs")
+            db.commit()
+            db.close()
+            conn.sendall("SUCCESS: All logs purged.".encode('utf-8'))
+
+    except Exception as e:
+        conn.sendall(f"ERROR: {str(e)}".encode('utf-8'))
     finally:
-        with clients_lock:
-            clients.pop(conn, None)
         conn.close()
-        log.info("Disconnected: %s", addr_str)
-        broadcast(f"[Server] {addr_str} left the chat.\n")
 
+def main():
+    initialize_db()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(5)
+    print(f"Indexer Server listening on port {PORT}...")
 
-def start_server() -> None:
-    """Create the server socket, accept clients, and spawn handler threads."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((HOST, PORT))
-        server.listen(MAX_CONNECTIONS)
-        log.info("Server listening on %s:%d", HOST, PORT)
-
-        try:
-            while True:
-                conn, addr = server.accept()
-                thread = threading.Thread(
-                    target=handle_client,
-                    args=(conn, addr),
-                    name=f"Client-{addr[0]}:{addr[1]}",
-                    daemon=True,   # Threads die when main thread exits
-                )
-                thread.start()
-                log.info("Active threads: %d", threading.active_count() - 1)
-
-        except KeyboardInterrupt:
-            log.info("Server shutting down.")
-
+    while True:
+        conn, addr = server.accept()
+        threading.Thread(target=handle_client, args=(conn, addr)).start()
 
 if __name__ == "__main__":
-    start_server()
+    main()
