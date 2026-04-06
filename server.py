@@ -1,15 +1,26 @@
+###
+# Server
+# Rosales, Kean Louis R.
+# Pinca, Evan
+# NSAPDEV S30
+###
+
 import socket
 import threading
 import re
 import sys
+import json
+import os
+import tempfile
 
-# ─── Configuration & Constants ────────────────────────────────────────────────
+
 HOST = "0.0.0.0"
 PORT = 65432
 BUFFER_SIZE = 8192
 MAX_CONNECTIONS = 10
+PERSIST_FILE = os.environ.get("LOG_STORE_PATH", "log_store.jsonl")
 
-# ─── Syslog Regex Patterns ────────────────────────────────────────────────────
+
 SYSLOG_PATTERN = re.compile(
     r'^(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+'   # timestamp  (e.g. "Feb 22 00:05:38")
     r'(\S+)\s+'                                    # hostname   (e.g. "SYSSVR1")
@@ -22,44 +33,103 @@ SEVERITY_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# ─── Readers-Writer Lock ──────────────────────────────────────────────────────
-class RWLock:
-    """A simple readers-writer lock built on threading.Condition.
 
-    Multiple readers may hold the lock concurrently, but a writer requires
-    exclusive access.  Writers are given priority once they begin waiting so
-    that a continuous stream of readers cannot starve a writer.
-    """
+class RWLock:
+ 
 
     def __init__(self):
-        self._read_ready = threading.Condition(threading.Lock())
+        self._lock = threading.Lock()           # protects _readers and _writers_waiting
+        self._no_writers = threading.Condition(self._lock)
+        self._no_readers = threading.Condition(self._lock)
         self._readers = 0
+        self._writer_active = False
+        self._writers_waiting = 0
+
 
     def acquire_read(self):
-        with self._read_ready:
+        with self._lock:
+            while self._writer_active or self._writers_waiting > 0:
+                self._no_writers.wait()
             self._readers += 1
 
     def release_read(self):
-        with self._read_ready:
+        with self._lock:
             self._readers -= 1
             if self._readers == 0:
-                self._read_ready.notify_all()
+                self._no_readers.notify_all()
 
     def acquire_write(self):
-        self._read_ready.acquire()
-        while self._readers > 0:
-            self._read_ready.wait()
+        with self._lock:
+            self._writers_waiting += 1
+            while self._readers > 0 or self._writer_active:
+                self._no_readers.wait()
+            self._writers_waiting -= 1
+            self._writer_active = True
 
     def release_write(self):
-        self._read_ready.release()
+        with self._lock:
+            self._writer_active = False
+            # Wake writers first (writer priority), then readers
+            self._no_readers.notify_all()
+            self._no_writers.notify_all()
 
-# ─── Shared In-Memory Log Store ───────────────────────────────────────────────
-log_store = []        # list of parsed log-entry dicts
+
+log_store = []       
 store_lock = RWLock()
 
-# ─── Syslog Parser ────────────────────────────────────────────────────────────
+def _load_from_disk():
+    if not os.path.exists(PERSIST_FILE):
+        return
+    loaded = []
+    try:
+        with open(PERSIST_FILE, "r", encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    loaded.append(entry)
+                except json.JSONDecodeError as e:
+                    print(f"[Warning] Skipping corrupt JSONL line {lineno}: {e}",
+                          file=sys.stderr)
+        log_store.extend(loaded)
+        print(f"[Persistence] Loaded {len(loaded):,} entries from '{PERSIST_FILE}'.")
+    except OSError as e:
+        print(f"[Warning] Could not read persist file '{PERSIST_FILE}': {e}",
+              file=sys.stderr)
+
+
+def _append_to_disk(entries):
+    if not entries:
+        return
+    try:
+        with open(PERSIST_FILE, "a", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"[Warning] Could not write to persist file '{PERSIST_FILE}': {e}",
+              file=sys.stderr)
+
+
+def _rewrite_disk(entries):
+    dir_ = os.path.dirname(os.path.abspath(PERSIST_FILE)) or "."
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            os.replace(tmp_path, PERSIST_FILE)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+    except OSError as e:
+        print(f"[Warning] Could not rewrite persist file '{PERSIST_FILE}': {e}",
+              file=sys.stderr)
+
+
 def parse_syslog_line(line):
-    """Parse a single syslog line into a dict, or return None on failure."""
     line = line.strip()
     if not line:
         return None
@@ -71,10 +141,8 @@ def parse_syslog_line(line):
 
     timestamp, host, daemon, pid, message = match.groups()
 
-    # Extract severity from the message body; default to INFO
     sev_match = SEVERITY_PATTERN.search(message)
     severity = sev_match.group(1).upper() if sev_match else "INFO"
-    # Normalize "WARN" → "WARNING"
     if severity == "WARN":
         severity = "WARNING"
 
@@ -88,9 +156,7 @@ def parse_syslog_line(line):
         "message":   message,
     }
 
-# ─── Response Formatter ──────────────────────────────────────────────────────
 def format_results(entries, label, value):
-    """Return a human-readable numbered list of matching log entries."""
     if not entries:
         return f"No entries found for {label} '{value}'.\n"
     count = len(entries)
@@ -99,9 +165,7 @@ def format_results(entries, label, value):
     lines = [f"  {i+1}. {e['raw']}" for i, e in enumerate(entries)]
     return header + "\n".join(lines) + "\n"
 
-# ─── Command Handlers ─────────────────────────────────────────────────────────
 def handle_ingest(payload):
-    """Parse syslog lines from *payload* and append them to the shared store."""
     lines = payload.splitlines()
     parsed = []
     for line in lines:
@@ -115,12 +179,13 @@ def handle_ingest(payload):
     finally:
         store_lock.release_write()
 
+    _append_to_disk(parsed)
+
     n = len(parsed)
     return f"SUCCESS: File received and {n:,} syslog entries parsed and indexed.\n"
 
 
 def handle_search_host(hostname):
-    """Return all entries whose hostname contains *hostname* (case-insensitive)."""
     hostname_lower = hostname.lower()
     store_lock.acquire_read()
     try:
@@ -131,7 +196,6 @@ def handle_search_host(hostname):
 
 
 def handle_search_date(date_str):
-    """Return entries whose timestamp starts with *date_str*."""
     store_lock.acquire_read()
     try:
         results = [e for e in log_store if e["timestamp"].startswith(date_str)]
@@ -141,7 +205,6 @@ def handle_search_date(date_str):
 
 
 def handle_search_daemon(daemon_name):
-    """Return entries whose daemon matches *daemon_name* (case-insensitive)."""
     daemon_lower = daemon_name.lower()
     store_lock.acquire_read()
     try:
@@ -152,7 +215,6 @@ def handle_search_daemon(daemon_name):
 
 
 def handle_search_severity(severity):
-    """Return entries whose severity matches *severity* (case-insensitive)."""
     severity_upper = severity.upper()
     store_lock.acquire_read()
     try:
@@ -163,7 +225,6 @@ def handle_search_severity(severity):
 
 
 def handle_search_keyword(keyword):
-    """Return entries whose message contains *keyword* (case-insensitive)."""
     keyword_lower = keyword.lower()
     store_lock.acquire_read()
     try:
@@ -174,7 +235,6 @@ def handle_search_keyword(keyword):
 
 
 def handle_count_keyword(keyword):
-    """Return a count of entries whose message contains *keyword*."""
     keyword_lower = keyword.lower()
     store_lock.acquire_read()
     try:
@@ -186,21 +246,20 @@ def handle_count_keyword(keyword):
 
 
 def handle_purge():
-    """Erase all indexed log entries under an exclusive write lock."""
     store_lock.acquire_write()
     try:
         n = len(log_store)
         log_store.clear()
     finally:
         store_lock.release_write()
+
+    _rewrite_disk([])   # truncate / recreate empty
+
     return f"SUCCESS: {n:,} indexed log entries have been erased.\n"
 
-# ─── Connection Handler ──────────────────────────────────────────────────────
 def handle_client(conn, addr):
-    """Receive a full request from the client, route it, and send a response."""
     print(f"[+] Connection from {addr}")
     try:
-        # Receive all data until the client signals shutdown(SHUT_WR)
         chunks = []
         while True:
             data = conn.recv(BUFFER_SIZE)
@@ -213,7 +272,6 @@ def handle_client(conn, addr):
             conn.sendall(b"ERROR: Empty request received.\n")
             return
 
-        # ── Route by command prefix ──────────────────────────────────────
         if raw_message.startswith("INGEST "):
             payload = raw_message[len("INGEST "):]
             response = handle_ingest(payload)
@@ -260,9 +318,9 @@ def handle_client(conn, addr):
         conn.close()
         print(f"[-] Connection closed: {addr}")
 
-# ─── Server Bootstrap ─────────────────────────────────────────────────────────
 def start_server(host, port):
-    """Create, bind, and listen on a TCP socket; spawn a thread per client."""
+    _load_from_disk()   
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((host, port))
@@ -280,7 +338,6 @@ def start_server(host, port):
     finally:
         server.close()
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     host = HOST
     port = PORT
