@@ -17,6 +17,7 @@ HOST = "0.0.0.0"
 PORT = 65432
 BUFFER_SIZE = 8192
 MAX_CONNECTIONS = 10
+MAX_RESULTS = 100
 PERSIST_FILE = os.environ.get("LOG_STORE_PATH", "log_store.jsonl")
 
 INGEST_BATCH_SIZE = 500
@@ -24,7 +25,7 @@ INGEST_BATCH_SIZE = 500
 SYSLOG_PATTERN = re.compile(
     r'^(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+'   
     r'(\S+)\s+'                                    
-    r'(\w[\w\-]*)(?:\[(\d+)\])?:\s+'             
+    r'([\w\-/]+)(?:\[(\d+)\])?:\s+'             
     r'(.*)$'                                      
 )
 
@@ -155,9 +156,14 @@ def format_results(entries, label, value):
     if not entries:
         return f"No entries found for {label} '{value}'.\n"
     count = len(entries)
+    limited_entries = entries[:MAX_RESULTS]
     noun = "entry" if count == 1 else "entries"
     header = f"Found {count} matching {noun} for {label} '{value}':\n"
-    lines = [f"  {i+1}. {e['raw']}" for i, e in enumerate(entries)]
+    lines = [f"  {i+1}. {e['raw']}" for i, e in enumerate(limited_entries)]
+
+    if count > MAX_RESULTS:
+        lines.append(f"\n[Output truncated to first {MAX_RESULTS} results]")
+
     return header + "\n".join(lines) + "\n"
 
 def handle_ingest(payload):
