@@ -13,19 +13,19 @@ import json
 import os
 import tempfile
 
-
 HOST = "0.0.0.0"
 PORT = 65432
 BUFFER_SIZE = 8192
 MAX_CONNECTIONS = 10
 PERSIST_FILE = os.environ.get("LOG_STORE_PATH", "log_store.jsonl")
 
+INGEST_BATCH_SIZE = 500
 
 SYSLOG_PATTERN = re.compile(
-    r'^(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+'   # timestamp  (e.g. "Feb 22 00:05:38")
-    r'(\S+)\s+'                                    # hostname   (e.g. "SYSSVR1")
-    r'(\w[\w\-]*)(?:\[(\d+)\])?:\s+'              # daemon[pid]: (e.g. "systemd[1]:")
-    r'(.*)$'                                       # message
+    r'^(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+'   
+    r'(\S+)\s+'                                    
+    r'(\w[\w\-]*)(?:\[(\d+)\])?:\s+'             
+    r'(.*)$'                                      
 )
 
 SEVERITY_PATTERN = re.compile(
@@ -33,18 +33,14 @@ SEVERITY_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-
 class RWLock:
- 
-
     def __init__(self):
-        self._lock = threading.Lock()           # protects _readers and _writers_waiting
+        self._lock = threading.Lock()           
         self._no_writers = threading.Condition(self._lock)
         self._no_readers = threading.Condition(self._lock)
         self._readers = 0
         self._writer_active = False
         self._writers_waiting = 0
-
 
     def acquire_read(self):
         with self._lock:
@@ -69,7 +65,6 @@ class RWLock:
     def release_write(self):
         with self._lock:
             self._writer_active = False
-            # Wake writers first (writer priority), then readers
             self._no_readers.notify_all()
             self._no_writers.notify_all()
 
@@ -167,22 +162,36 @@ def format_results(entries, label, value):
 
 def handle_ingest(payload):
     lines = payload.splitlines()
-    parsed = []
+    total_committed = 0
+    batch = []
+
     for line in lines:
         entry = parse_syslog_line(line)
-        if entry is not None:
-            parsed.append(entry)
+        if entry is None:
+            continue
+        batch.append(entry)
 
-    store_lock.acquire_write()
-    try:
-        log_store.extend(parsed)
-    finally:
-        store_lock.release_write()
+        if len(batch) >= INGEST_BATCH_SIZE:
+            store_lock.acquire_write()
+            try:
+                log_store.extend(batch)
+            finally:
+                store_lock.release_write()
+            _append_to_disk(batch)
+            total_committed += len(batch)
+            batch = []
+            threading.Event().wait(0)
 
-    _append_to_disk(parsed)
+    if batch:
+        store_lock.acquire_write()
+        try:
+            log_store.extend(batch)
+        finally:
+            store_lock.release_write()
+        _append_to_disk(batch)
+        total_committed += len(batch)
 
-    n = len(parsed)
-    return f"SUCCESS: File received and {n:,} syslog entries parsed and indexed.\n"
+    return f"SUCCESS: File received and {total_committed:,} syslog entries parsed and indexed.\n"
 
 
 def handle_search_host(hostname):
@@ -253,8 +262,7 @@ def handle_purge():
     finally:
         store_lock.release_write()
 
-    _rewrite_disk([])   # truncate / recreate empty
-
+    _rewrite_disk([])   
     return f"SUCCESS: {n:,} indexed log entries have been erased.\n"
 
 def handle_client(conn, addr):
