@@ -25,7 +25,7 @@ INGEST_BATCH_SIZE = 500
 SYSLOG_PATTERN = re.compile(
     r'^(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+'   
     r'(\S+)\s+'                                    
-    r'([\w\-/]+)(?:\[(\d+)\])?:\s+'             
+    r'(\w[\w\-]*)(?:\[(\d+)\])?:\s+'             
     r'(.*)$'                                      
 )
 
