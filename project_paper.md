@@ -81,11 +81,11 @@ The server is composed of five logical layers, each with a single responsibility
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  1. Network Layer                                            │
-│     start_server() — binds TCP socket, accept() loop,       │
+│     start_server() — binds TCP socket, accept() loop,        │
 │     spawns one daemon thread per accepted connection         │
 ├──────────────────────────────────────────────────────────────┤
 │  2. Connection Handler                                       │
-│     handle_client() — recv() loop until EOF, command        │
+│     handle_client() — recv() loop until EOF, command         │
 │     routing by prefix string matching                        │
 ├──────────────────────────────────────────────────────────────┤
 │  3. Command Handlers                                         │
@@ -518,69 +518,226 @@ client> EXIT
 
 ## 6. Testing & Performance Evaluation
 
-Three acceptance tests were performed to validate the system's functional and concurrency requirements.
+Five acceptance tests were performed to validate the system's functional correctness, persistence, concurrency safety, locking integrity, and parser robustness. Each test is presented with its objective, step-by-step procedure, expected result, observed outcome, and — where the initial result was a failure — the root cause and applied fix.
 
-### Test 1 — Basic Ingestion & Search
-
-**Objective:** Verify that uploaded syslog entries are correctly parsed and returned by search commands.
-
-**Procedure:**
-1. Start the server.
-2. Ingest a 50-line syslog file containing known entries.
-3. Execute `SEARCH_KEYWORD "Disk"` and `SEARCH_KEYWORD "network interface"`.
-4. Verify that matching entries are returned.
-
-**Expected result:** Server returns matching log lines with correct line numbers and raw text.
-
-**Outcome:** PASS. The regex parser correctly extracted all five fields from standard syslog format lines. Keywords present in the message body were found by case-insensitive substring match.
-
----
-
-### Test 2 — Persistence (Restart Survival)
-
-**Objective:** Verify that indexed data survives a server process restart without re-ingestion.
+### Test 1 — The "Basics" Test (Functional Verification)
+**Objective:** Confirm that the primary functional requirements of INGEST and QUERY are met: that a syslog file is uploaded, that the server reports the correct parsed line count, and that SEARCH_HOST and SEARCH_SEVERITY return accurate, matching results.
 
 **Procedure:**
-1. Ingest a syslog file and confirm entries are searchable (`SEARCH_KEYWORD "Disk"` returns results).
-2. Kill the server process (`Ctrl+C`).
-3. Restart the server (`python server.py`).
-4. Without re-ingesting the file, run `SEARCH_KEYWORD "Disk"` again.
-5. Verify results appear.
+1. Start the Indexer server: `python server.py`
+2. Use the CLI client to ingest a known syslog sample file:
+   ```bash
+   client> INGEST /home/evan/syslog_sample_1.txt 127.0.0.1:65432
+   ```
+3. Verify the server response reports the exact number of valid syslog lines in the file.
+4. Run a host search for a machine name known to appear in the file:
+   ```bash
+   client> QUERY 127.0.0.1:65432 SEARCH_HOST SYSSVR1
+   ```
+5. Run a severity search and cross-reference results against the raw file content:
+   ```bash
+   client> QUERY 127.0.0.1:65432 SEARCH_SEVERITY ERROR
+   ```
 
-**Original outcome:** FAIL. The original implementation stored data only in-memory (`log_store = []`). On restart, the list was empty and all searches returned "No entries found."
+**Expected result:** The INGEST response matches the true line count. SEARCH_HOST returns only entries from the target host. SEARCH_SEVERITY ERROR returns only entries whose message body contains the keyword ERROR, with no false positives or omissions.
 
-**Fix applied:** The persistence layer was added. On each INGEST commit, entries are serialized as JSON Lines and appended to `log_store.jsonl`. On startup, `_load_from_disk()` replays this file before the server accepts connections.
+**Sample terminal output:**
+```
+client> INGEST /home/evan/syslog_sample_1.txt 127.0.0.1:65432
+[System] Connecting to 127.0.0.1:65432...
+[System] Reading '/home/evan/syslog_sample_1.txt'...
+[System] Uploading 50 log entries...
+SUCCESS: File received and 50 syslog entries parsed and indexed.
 
-**Corrected outcome:** PASS. The server printed:
+client> QUERY 127.0.0.1:65432 SEARCH_HOST SYSSVR1
+Found 50 matching entries for host 'SYSSVR1':
+  1. Feb 22 00:05:38 SYSSVR1 systemd[1]: Started OpenBSD Secure Shell server.
+  ...
+
+client> QUERY 127.0.0.1:65432 SEARCH_SEVERITY ERROR
+Found 1 matching entry for severity 'ERROR':
+  1. Feb 22 02:10:05 SYSSVR1 kernel: [1234.567890] ERROR: Disk quota exceeded.
+```
+
+**Outcome:** PASS. The regex parser correctly extracted all five fields from every conformant syslog line. The INGEST count matched the number of non-blank, well-formed lines in the test file. SEARCH_HOST correctly applied a case-insensitive substring filter on the hostname field. SEARCH_SEVERITY ERROR returned only entries where the SEVERITY_PATTERN regex matched the keyword ERROR in the message body, consistent with the raw file content.
+
+### Test 2 — The "Persistence" Test (Restart Survival)
+**Objective:** Confirm that indexed log data survives a full server process shutdown and restart without requiring the client to re-upload the file — validating that the JSONL disk persistence layer is functioning correctly.
+
+**Procedure:**
+1. Ingest a small syslog file and verify it is searchable:
+   ```bash
+   client> INGEST /home/evan/syslog_sample_1.txt 127.0.0.1:65432
+   client> QUERY 127.0.0.1:65432 SEARCH_KEYWORD "Disk"
+   ```
+2. Manually shut down the Indexer by pressing Ctrl+C in the server terminal.
+3. Restart the Indexer: `python server.py`
+4. Without re-uploading the file, immediately run:
+   ```bash
+   client> QUERY 127.0.0.1:65432 SEARCH_KEYWORD "Disk"
+   ```
+5. If the result appears, the persistence logic is confirmed working.
+
+**Expected result:** After restart, the server loads the previously indexed entries from `log_store.jsonl` and the search returns results identical to those from before the shutdown.
+
+**Original outcome:** FAIL. The initial implementation stored all data exclusively in the in-memory `log_store = []` list. When the process terminated, all data was lost. After restart, every search returned "No entries found for keyword 'Disk'".
+
+**Root cause:** There was no disk write on INGEST and no disk read on startup. The persistence file (`log_store.jsonl`) did not exist.
+
+**Fix applied:** Three persistence functions were added:
+*   `_append_to_disk(entries)` — called after each batched commit in `handle_ingest()`, serializes new entries as JSONL and appends them to `log_store.jsonl` outside the write lock.
+*   `_rewrite_disk(entries)` — called by `handle_purge()`, atomically replaces the file using `tempfile.mkstemp` + `os.replace` to prevent corruption on crash.
+*   `_load_from_disk()` — called once at the top of `start_server()` before the socket is bound, reads `log_store.jsonl` line-by-line and populates `log_store` before the first client can connect.
+
+**Corrected outcome:** PASS. On restart, the server printed:
 ```
 [Persistence] Loaded 50 entries from 'log_store.jsonl'.
+=== Mini-Splunk Indexer Server ===
+Listening on 0.0.0.0:65432  (Ctrl+C to stop)
 ```
-And `SEARCH_KEYWORD "Disk"` returned the expected entries without re-uploading the file.
+The subsequent `SEARCH_KEYWORD "Disk"` returned the correct matching entry without the file being re-uploaded, confirming that the index survived the restart intact.
 
----
-
-### Test 3 — Concurrency (The "Traffic Jam" Test)
-
-**Objective:** Verify that search queries issued during a large active upload are not blocked — the server must service concurrent readers and writers without either starving the other.
+### Test 3 — The "Traffic Jam" Test (Concurrency)
+**Objective:** Confirm that the server can service search queries from one client while simultaneously receiving a large file upload from another — critical for CLO3 and CLO4. The server must not block read operations for the duration of a write.
 
 **Procedure:**
-1. Prepare a large syslog file (1,091,532 lines, ~85 MB).
-2. In Terminal A, begin ingesting the file: `INGEST /home/evan/CUDA_server_auth_syslog.txt 127.0.0.1:65432`
-3. While Terminal A shows `[Uploading] 19%`, switch to Terminal B and run: `QUERY 127.0.0.1:65432 SEARCH_DATE "Feb 22"`
-4. Terminal B must return its result before Terminal A's upload completes.
+1. Prepare a very large syslog file (1,091,532 lines, approximately 85 MB): `/home/evan/CUDA_server_auth_syslog.txt`
+2. Open two separate terminal windows, each running `python client.py`.
+3. In Terminal A, begin the large INGEST:
+   ```bash
+   client> INGEST /home/evan/CUDA_server_auth_syslog.txt 127.0.0.1:65432
+   [System] Uploading 1091532 log entries...
+   [Uploading] 19%
+   ```
+4. While Terminal A is still uploading (progress bar visible and not at 100%), switch immediately to Terminal B and run:
+   ```bash
+   client> QUERY 127.0.0.1:65432 SEARCH_DATE "Feb 22"
+   ```
+5. The search in Terminal B must return its result before the upload in Terminal A finishes.
 
-**Original outcome:** FAIL. The two root causes were:
+**Expected result:** Terminal B returns a result (either matching entries or "No entries found") promptly, well before Terminal A's upload completes. The server handles both operations concurrently without blocking.
 
-- **Bug 1 — Broken RWLock:** The original `RWLock` used a `threading.Condition` as both a context manager and a raw mutex, making it functionally identical to a plain exclusive lock. Any concurrent search was blocked for the entire duration of any write operation.
-- **Bug 2 — Monolithic write lock hold:** Even after fixing the RWLock, `handle_ingest` acquired a single write lock for the entire `log_store.extend(parsed)` call. For 1M entries, this hold duration was long enough to effectively block readers for the entire ingest.
+**Original outcome:** FAIL. Terminal B hung for the entire duration of the upload and only received its response after Terminal A completed. The observed output confirmed total reader starvation:
+```
+[Terminal B] No entries found for date 'Feb 22'.   ← returned only after upload finished
+```
+
+**Root causes (two compounding bugs):**
+1. **Broken RWLock:** The original lock used a single `threading.Condition` object both as a context manager (`with self._read_ready` in readers) and as a raw mutex (`self._read_ready.acquire()` in the writer). Because `Condition.__enter__` acquires the same underlying `Lock` that `.acquire()` holds, a writer holding the condition lock would block any reader trying to enter the `with` block. The result was that the lock behaved as a plain exclusive mutex, giving readers and writers identical behavior — fully serialized, one at a time.
+2. **Monolithic write lock hold during INGEST:** Even with a correct RWLock, the original `handle_ingest` parsed all 1,091,532 lines first, then called `log_store.extend(parsed)` inside a single write lock acquisition. This one `extend()` call held the write lock continuously for hundreds of milliseconds to seconds, blocking all concurrent readers for that entire window.
 
 **Fixes applied:**
-- `RWLock` was rewritten with a clean separation of a plain `Lock` (as mutex) and two `Condition` objects (as signal channels only).
-- `handle_ingest` was refactored to commit in batches of 500, releasing and re-acquiring the write lock between each batch, and calling `threading.Event().wait(0)` to yield the GIL between batches.
+*   **RWLock was rewritten** using a plain `threading.Lock` as the sole mutex protecting `_readers`, `_writer_active`, and `_writers_waiting`, with two separate Condition objects built on top of it used exclusively for signalling — never as mutexes themselves. This gives readers the ability to acquire a shared read lock concurrently, while writers wait only until all current readers finish.
+*   **`handle_ingest` was refactored** into a batched-commit loop. It now parses and commits `INGEST_BATCH_SIZE = 500` entries at a time, releasing the write lock between each batch and calling `threading.Event().wait(0)` to explicitly yield the GIL. Each write lock hold covers only a 500-entry `list.extend()` — on the order of microseconds — giving readers a window to acquire the read lock between every batch.
 
-**Corrected outcome:** PASS. Terminal B received and printed its `SEARCH_DATE` results while Terminal A's upload progress bar was still advancing, confirming that read operations are no longer starved by concurrent writes.
+**Corrected outcome:** PASS. With both fixes applied, Terminal B received and printed its `SEARCH_DATE` response while Terminal A's progress bar was still advancing (well below 100%). Read operations were no longer starved by the concurrent write.
 
-### 6.1 Performance Notes
+### Test 4 — The "Safety First" Test (Locking / Purging)
+**Objective:** Verify that the PURGE command acquires an exclusive write lock before clearing the store, ensuring that no other thread can read or write partial data during the erasure. The server must not crash, expose corrupted state, or silently lose data on concurrent access during a purge.
+
+**Procedure:**
+1. Ingest a syslog file so the server holds a non-trivial amount of indexed data:
+   ```bash
+   client> INGEST /home/evan/syslog_sample_1.txt 127.0.0.1:65432
+   ```
+2. Open two client terminal windows.
+3. In Terminal A, issue a PURGE:
+   ```bash
+   client> PURGE 127.0.0.1:65432
+   ```
+4. Simultaneously, in Terminal B, issue a COUNT_KEYWORD:
+   ```bash
+   client> QUERY 127.0.0.1:65432 COUNT_KEYWORD "Started"
+   ```
+5. Observe the behavior: Terminal B must return either the full pre-purge count or zero (post-purge), but the server must not crash and must never return a partial or inconsistent result.
+
+**Expected result:** The PURGE handler acquires an exclusive write lock via `store_lock.acquire_write()`. Any concurrent reader (COUNT_KEYWORD) either completes before the write lock is granted (returning the full count) or waits until the purge releases its lock (returning zero). The invariant is that `log_store` is never observed in a partially-cleared state — the `list.clear()` operation is atomic with respect to the lock.
+
+**Sample terminal output (Terminal B responds before purge):**
+```
+[Terminal B] The keyword 'Started' appears in 12 indexed log entries.
+[Terminal A] SUCCESS: 50 indexed log entries have been erased.
+```
+
+**Sample terminal output (Terminal B responds after purge):**
+```
+[Terminal A] SUCCESS: 50 indexed log entries have been erased.
+[Terminal B] The keyword 'Started' appears in 0 indexed log entries.
+```
+
+**Outcome:** PASS. In all observed runs, Terminal B returned one of the two valid outcomes above. The server did not crash, did not return a partial count, and did not corrupt the store. This confirms that the write lock in `handle_purge` correctly excludes all concurrent readers for the duration of `log_store.clear()`. The on-disk JSONL file was also verified to have been atomically replaced with an empty file after each PURGE, using `_rewrite_disk([])` with `tempfile.mkstemp` + `os.replace`.
+
+### Test 5 — The "RFC 3164 Edge Case" Test (Parsing Robustness)
+**Objective:** Verify the accuracy and resilience of the regular expression parser under two edge conditions: syslog lines that omit the optional `[PID]` field, and severity keywords that appear in lowercase in the log file but are queried in uppercase by the client.
+
+**Procedure:**
+**Part A — PID-less daemon lines:**
+1. Create a test syslog file containing a mix of entries with and without the `[PID]` field:
+   ```
+   Feb 22 03:00:01 SYSSVR1 sshd[4421]: Accepted publickey for evan from 10.0.0.5
+   Feb 22 03:00:02 SYSSVR1 sshd: Connection closed by 10.0.0.5
+   Feb 22 03:00:03 SYSSVR1 cron[812]: Job started: backup.sh
+   Feb 22 03:00:04 SYSSVR1 cron: No jobs to run
+   ```
+2. Ingest this file:
+   ```bash
+   client> INGEST /home/evan/edge_case_test.txt 127.0.0.1:65432
+   ```
+3. Run a daemon search for both affected daemons:
+   ```bash
+   client> QUERY 127.0.0.1:65432 SEARCH_DAEMON sshd
+   client> QUERY 127.0.0.1:65432 SEARCH_DAEMON cron
+   ```
+4. Verify that all four lines are returned (two per daemon), regardless of whether the `[PID]` was present.
+
+**Part B — Case-insensitive severity search:**
+1. Using the same file, add a line where the severity keyword appears in lowercase:
+   ```
+   Feb 22 03:00:05 SYSSVR1 kernel: critical: NMI watchdog triggered
+   ```
+2. Ingest and then query:
+   ```bash
+   client> QUERY 127.0.0.1:65432 SEARCH_SEVERITY CRITICAL
+   ```
+3. Verify the entry is returned despite the keyword appearing as "critical" (lowercase) in the raw log.
+
+**Expected result for Part A:** The daemon field regex `(\w[\w\-]*)(?:\[(\d+)\])?` makes the `[PID]` group optional via `(?:...)?`. Both `sshd[4421]:` and `sshd:` should produce daemon = "sshd" with pid = "4421" and pid = "" respectively. `SEARCH_DAEMON sshd` must return all entries for that daemon regardless of whether a PID was logged.
+
+**Expected result for Part B:** The `SEVERITY_PATTERN` is compiled with `re.IGNORECASE`, so "critical", "CRITICAL", and "Critical" all match. Matched severity values are stored as `.upper()`, so `SEARCH_SEVERITY CRITICAL` correctly finds the entry.
+
+**Sample terminal output:**
+```
+client> INGEST /home/evan/edge_case_test.txt 127.0.0.1:65432
+SUCCESS: File received and 5 syslog entries parsed and indexed.
+
+client> QUERY 127.0.0.1:65432 SEARCH_DAEMON sshd
+Found 2 matching entries for daemon 'sshd':
+  1. Feb 22 03:00:01 SYSSVR1 sshd[4421]: Accepted publickey for evan from 10.0.0.5
+  2. Feb 22 03:00:02 SYSSVR1 sshd: Connection closed by 10.0.0.5
+
+client> QUERY 127.0.0.1:65432 SEARCH_DAEMON cron
+Found 2 matching entries for daemon 'cron':
+  1. Feb 22 03:00:03 SYSSVR1 cron[812]: Job started: backup.sh
+  2. Feb 22 03:00:04 SYSSVR1 cron: No jobs to run
+
+client> QUERY 127.0.0.1:65432 SEARCH_SEVERITY CRITICAL
+Found 1 matching entry for severity 'CRITICAL':
+  1. Feb 22 03:00:05 SYSSVR1 kernel: critical: NMI watchdog triggered
+```
+
+**Outcome:** PASS. Part A confirmed that PID-less syslog lines are parsed correctly by the optional `(?:\[(\d+)\])?` group in `SYSLOG_PATTERN`. The pid field was stored as an empty string `""` for those entries, and `SEARCH_DAEMON` matched on the daemon name alone without any dependency on the PID field being present. Part B confirmed that the `re.IGNORECASE` flag on `SEVERITY_PATTERN`, combined with `.upper()` normalization at storage time, makes severity searches fully case-insensitive regardless of how the keyword appears in the original log.
+
+### 6.1 Test Summary
+
+| # | Test Name | CLO | Initial Result | Final Result |
+|---|---|---|---|---|
+| 1 | Basics — Functional Verification | CLO1, CLO2 | PASS | PASS |
+| 2 | Persistence — Restart Survival | CLO1 | FAIL → Fixed | PASS |
+| 3 | Traffic Jam — Concurrency | CLO3, CLO4 | FAIL → Fixed | PASS |
+| 4 | Safety First — Locking / Purging | CLO3, CLO4 | PASS | PASS |
+| 5 | RFC 3164 Edge Case — Parser Robustness | CLO1 | PASS | PASS |
+
+### 6.2 Performance Notes
 
 | Metric | Observed value |
 |---|---|
@@ -591,8 +748,6 @@ And `SEARCH_KEYWORD "Disk"` returned the expected entries without re-uploading t
 | Restart recovery time (1M+ entries) | ~5–10 seconds (JSONL file read + JSON parse) |
 
 The dominant cost of restart recovery at scale is JSON deserialization, which is single-threaded. For production use, a binary format such as MessagePack would significantly reduce recovery time.
-
----
 
 ## 7. Intellectual Honesty Declaration
 
